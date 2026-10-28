@@ -1,4 +1,4 @@
-//go:build linux || darwin || freebsd || solaris
+//go:build linux || darwin || freebsd || solaris || haiku
 
 /*
    Copyright The containerd Authors.

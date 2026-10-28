@@ -1,4 +1,4 @@
-//go:build linux || openbsd || dragonfly || solaris
+//go:build linux || openbsd || dragonfly || solaris || haiku
 
 /*
    Copyright The containerd Authors.

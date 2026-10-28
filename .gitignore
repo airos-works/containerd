@@ -11,3 +11,4 @@ _site/
 releases/*.tar.gz
 releases/*.tar.gz.sha256sum
 _output/
+build/
