@@ -36,6 +36,11 @@ var tempMountLocation = getTempDir()
 // same upper / work dirs. Since it's a temp mount, avoid using that option here
 // if found.
 func WithTempMount(ctx context.Context, mounts []Mount, f func(root string) error) (err error) {
+	// Haiku has no bind-mount support: a single bind mount aliases its
+	// source, so operate on the source directly instead of mounting.
+	if len(mounts) == 1 && mounts[0].Type == "bind" {
+		return f(mounts[0].Source)
+	}
 	root, uerr := os.MkdirTemp(tempMountLocation, "containerd-mount")
 	if uerr != nil {
 		return fmt.Errorf("failed to create temp dir: %w", uerr)

@@ -398,10 +398,10 @@ func NsecToTimeval(nsec int64) (tv Timeval) {
 // utimensat(2) serves directory-relative paths; for the common AT_FDCWD case
 // UtimesNano provides the same result.
 func UtimesNanoAt(dirfd int, path string, ts []Timespec, flags int) error {
-	if dirfd == AT_FDCWD && flags == 0 {
-		return syscall.UtimesNano(path, ts)
+	if len(ts) != 2 {
+		return EINVAL
 	}
-	return ENOSYS
+	return syscall.UtimesNanoAt(dirfd, path, &[2]syscall.Timespec{ts[0], ts[1]}, flags)
 }
 
 // Major returns the major component of a Haiku device number.
