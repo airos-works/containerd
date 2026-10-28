@@ -18,8 +18,9 @@ for arch in "${@:-amd64 arm64}"; do
     [ "$arch" = "amd64" ] && haiku_arch=x86_64
     bin="build/haiku-$arch/containerd"
     [ -f "$bin" ] || { echo ">> building $arch first"; bash tools/build-haiku.sh "$arch"; }
-    rm -rf "$STAGE/bin/containerd" "$STAGE/.PackageInfo"
+    rm -rf "$STAGE/bin/containerd" "$STAGE/bin/containerd-shim-runc-v2" "$STAGE/.PackageInfo"
     cp "$bin" "$STAGE/bin/containerd"
+    cp "build/haiku-$arch/containerd-shim-runc-v2" "$STAGE/bin/containerd-shim-runc-v2"
     cp docs/airos.md "$STAGE/documentation/packages/containerd/"
     cat > "$STAGE/.PackageInfo" <<PKGEOF
 name containerd
@@ -34,6 +35,7 @@ licenses { "Apache v2" }
 provides {
     containerd = $VERSION
     cmd:containerd = $VERSION
+    cmd:containerd-shim-runc-v2 = $VERSION
 }
 requires {
     haiku >= r1~beta5

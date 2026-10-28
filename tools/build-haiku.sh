@@ -14,5 +14,7 @@ for arch in "${ARCHES[@]}"; do
     echo ">> building haiku/$arch -> $out"
     GOOS=haiku GOARCH="$arch" CGO_ENABLED=0 GOFLAGS=-mod=vendor \
         "$GO" build -trimpath -ldflags="-s -w" -o "$out" ./cmd/containerd
-    ls -la "$out"
+    "$GO" build -trimpath -ldflags="-s -w" \
+        -o "build/haiku-$arch/containerd-shim-runc-v2" ./cmd/containerd-shim-haiku-v2/
+    ls -la "$out" "build/haiku-$arch/containerd-shim-runc-v2"
 done
