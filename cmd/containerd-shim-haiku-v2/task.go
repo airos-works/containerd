@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	eventtypes "github.com/containerd/containerd/api/events"
 	taskpb "github.com/containerd/containerd/api/types/task"
@@ -65,6 +67,10 @@ type proc struct {
 	stdoutPath string
 	stderrPath string
 
+	// Terminal state: master is the pty master; the child holds the slave.
+	master   *os.File
+	ptySlave *os.File
+
 	waitCh chan struct{}
 }
 
@@ -84,6 +90,53 @@ func newHaikuTaskService(publisher events.Publisher) *haikuTaskService {
 		execs:     make(map[string]map[string]*proc),
 		publisher: publisher,
 	}
+}
+
+// ptySlaveFile holds the slave side between openPty and spawn (package
+// level because openPty runs before the child command is built).
+var ptySlaveFile *os.File
+
+// openPty allocates a pty master/slave pair (Haiku /dev/tt/pN).
+func openPty() (*os.File, error) {
+	mfd, err := syscall.PosixOpenpt(syscall.O_RDWR | 0x20000 /* O_NOCTTY */)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Grantpt(mfd); err != nil {
+		syscall.Close(mfd)
+		return nil, err
+	}
+	if err := syscall.Unlockpt(mfd); err != nil {
+		syscall.Close(mfd)
+		return nil, err
+	}
+	name, err := syscall.Ptsname(mfd)
+	if err != nil {
+		syscall.Close(mfd)
+		return nil, err
+	}
+	slave, err := os.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		syscall.Close(mfd)
+		return nil, err
+	}
+	ptySlaveFile = slave
+	return os.NewFile(uintptr(mfd), "ptymaster"), nil
+}
+
+// pumpPty copies between the pty master and the client's fifos until EOF.
+func pumpPty(master, stdin, stdout *os.File) {
+	go func() {
+		_, _ = io.Copy(master, stdin)
+	}()
+	go func() {
+		_, _ = io.Copy(stdout, master)
+	}()
+}
+
+// haikuWinsize matches struct winsize in termios.h.
+type haikuWinsize struct {
+	Row, Col, Xpixel, Ypixel uint16
 }
 
 // loadSpec reads the OCI configuration from the bundle directory.
@@ -159,6 +212,18 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 		}
 	}
 
+	childStdin, childStdout, childStderr := stdin, stdout, stderr
+	var master *os.File
+	if req.Terminal {
+		master, err = openPty()
+		if err != nil {
+			return nil, fmt.Errorf("allocate pty: %w", err)
+		}
+		childStdin = ptySlaveFile
+		childStdout = ptySlaveFile
+		childStderr = ptySlaveFile
+	}
+
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -170,9 +235,9 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 		envInitRootfs + "=" + spec.Root.Path,
 		envInitCwd + "=" + spec.Process.Cwd,
 	}, spec.Process.Env...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	cmd.Stdin = childStdin
+	cmd.Stdout = childStdout
+	cmd.Stderr = childStderr
 
 	t := &proc{
 		id:         req.ID,
@@ -186,6 +251,8 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 		stdinPath:  req.Stdin,
 		stdoutPath: req.Stdout,
 		stderrPath: req.Stderr,
+		master:     master,
+		ptySlave:   ptySlaveFile,
 		waitCh:     make(chan struct{}),
 	}
 	if err := cmd.Start(); err != nil {
@@ -193,6 +260,9 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	}
 	t.pid = cmd.Process.Pid
 	s.tasks[req.ID] = t
+	if master != nil {
+		go pumpPty(master, t.stdin, t.stdout)
+	}
 	go s.reap(ctx, t, req.ID, req.ID)
 
 	os.Stderr.WriteString(fmt.Sprintf("shim Create: spawned init pid=%d\n", t.pid))
@@ -255,6 +325,12 @@ func (s *haikuTaskService) reap(ctx context.Context, t *proc, containerID, event
 	}
 	if t.stderr != nil && t.stderr != t.stdout {
 		t.stderr.Close()
+	}
+	if t.ptySlave != nil {
+		t.ptySlave.Close()
+	}
+	if t.master != nil {
+		t.master.Close()
 	}
 }
 
@@ -457,6 +533,17 @@ func (s *haikuTaskService) Exec(ctx context.Context, req *taskapi.ExecProcessReq
 }
 
 func (s *haikuTaskService) ResizePty(ctx context.Context, req *taskapi.ResizePtyRequest) (*emptypb.Empty, error) {
+	s.mu.Lock()
+	t := s.findProc(req.ID, req.ExecID)
+	s.mu.Unlock()
+	if t == nil || t.master == nil {
+		return &emptypb.Empty{}, nil
+	}
+	ws := haikuWinsize{Row: uint16(req.Height), Col: uint16(req.Width)}
+	const tiocswinsz = 0x8000 + 13
+	if err := syscall.Ioctl(int(t.master.Fd()), tiocswinsz, uintptr(unsafe.Pointer(&ws))); err != nil {
+		return nil, err
+	}
 	return &emptypb.Empty{}, nil
 }
 
