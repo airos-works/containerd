@@ -14,8 +14,11 @@ docker fork conventions.
   airos-works/docker (vendored copy here): syscall-backed constants and
   wrappers, mount/xattr stubs reporting ENOSYS, SCM_RIGHTS reexports, and
   Wait4/WaitStatus for the reaper.
-- Snapshotter notes for Haiku: `vfs` needs no kernel mounts and works as-is;
-  bind/nullfs-style snapshotters need the mount backend, which is ENOSYS in
-  this stage. The shim/runtime plugins are not wired (no OCI runtime on
-  Haiku yet); content/image services are the next runtime milestone, driven
-  by the Engine (airos-works/moby stage 2).
+- Snapshotter notes for Haiku: `native` needs no kernel mounts and is
+  registered for haiku; the **haiku OCI shim** (`cmd/containerd-shim-haiku-v2`,
+  installed as `containerd-shim-runc-v2`) implements the shim v3 bootstrap
+  and TaskService over ttrpc, running containers as chrooted (or, until
+  per-snapshot bfs mounts land, cwd-isolated) processes.
+- **Verified (QEMU hrev59866):** `docker run` of an imported haiku/amd64
+  image prints container output with the correct exit code; `docker ps -a`,
+  `docker logs`, `docker rm` behave as on Linux.

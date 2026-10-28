@@ -35,7 +35,7 @@ licenses { "Apache v2" }
 provides {
     containerd = $VERSION
     cmd:containerd = $VERSION
-    cmd:containerd-shim-runc-v2 = $VERSION
+    cmd:containerd_shim_runc_v2 = $VERSION
 }
 requires {
     haiku >= r1~beta5
