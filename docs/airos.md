@@ -21,4 +21,7 @@ docker fork conventions.
   per-snapshot bfs mounts land, cwd-isolated) processes.
 - **Verified (QEMU hrev59866):** `docker run` of an imported haiku/amd64
   image prints container output with the correct exit code; `docker ps -a`,
-  `docker logs`, `docker rm` behave as on Linux.
+  `docker logs`, `docker rm` behave as on Linux; `docker run -i` streams
+  stdin with proper EOF; detached runs, `docker stop`, and `docker exec`
+  (including `exec -i`) work; `docker compose up` runs multi-service stacks
+  on host networking (the bridge driver is not ported).
