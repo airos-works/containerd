@@ -55,7 +55,12 @@ func runInit() error {
 	if rootfs == "" {
 		return fmt.Errorf("init: %s not set", envInitRootfs)
 	}
-	if os.Getenv(envInitChroot) == "1" {
+	// Chroot is opt-in: it is broken on current Haiku (executables exit
+	// silently inside a chroot even from a mount point), so containers
+	// run cwd-isolated by default. HAIKU_SHIM_INIT_CHROOT=1 forces it for
+	// kernels where chroot works.
+	chrootMode := os.Getenv(envInitChroot) == "1"
+	if chrootMode {
 		if err := syscall.Chroot(rootfs); err != nil {
 			return fmt.Errorf("init: chroot %s: %w", rootfs, err)
 		}
@@ -81,7 +86,7 @@ func runInit() error {
 	if len(argv) == 0 {
 		return fmt.Errorf("init: empty argv")
 	}
-	if os.Getenv(envInitChroot) != "1" && len(argv[0]) > 0 && argv[0][0] == '/' {
+	if !chrootMode && len(argv[0]) > 0 && argv[0][0] == '/' {
 		// Without chroot, absolute paths would resolve against the host
 		// root; make the entrypoint relative to the rootfs working dir.
 		argv[0] = "." + argv[0]
