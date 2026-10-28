@@ -37,14 +37,17 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// haikuTask is a running (or finished) container init process.
-type haikuTask struct {
+// proc is any supervised process: a container init or an exec process.
+type proc struct {
 	id     string
-	bundle string
-	spec   *specs.Spec
+	execID string
+	rootfs string
+	cwd    string
+	env    []string
 
 	cmd     *exec.Cmd
 	pid     int
@@ -58,22 +61,27 @@ type haikuTask struct {
 	stdout *os.File
 	stderr *os.File
 
-	waitOnce sync.Once
-	waitCh   chan struct{}
+	stdinPath  string
+	stdoutPath string
+	stderrPath string
+
+	waitCh chan struct{}
 }
 
 // haikuTaskService implements the containerd TaskService. Containers run
 // as chrooted processes spawned by the shim's own init re-exec; there is no
 // supervising runtime like runc.
 type haikuTaskService struct {
-	mu     sync.Mutex
-	tasks  map[string]*haikuTask
+	mu        sync.Mutex
+	tasks     map[string]*proc
+	execs     map[string]map[string]*proc // container id -> exec id -> proc
 	publisher events.Publisher
 }
 
 func newHaikuTaskService(publisher events.Publisher) *haikuTaskService {
 	return &haikuTaskService{
-		tasks:     make(map[string]*haikuTask),
+		tasks:     make(map[string]*proc),
+		execs:     make(map[string]map[string]*proc),
 		publisher: publisher,
 	}
 }
@@ -92,14 +100,15 @@ func loadSpec(bundle string) (*specs.Spec, error) {
 	return &s, nil
 }
 
-// openFifo opens a stdio fifo without blocking: like go-fifo, use
-// O_NONBLOCK and a read/write handle, which never waits for a peer and
-// works regardless of the order the daemon attaches its ends.
-func openFifo(path string, _ int) (*os.File, error) {
+// openFifo opens a stdio fifo. The daemon creates the fifos and opens
+// its ends before calling Create, so blocking opens succeed immediately
+// and give correct EOF/EPIPE semantics: stdin reads see EOF when the
+// client closes its write end, stdout writes fail with EPIPE on detach.
+func openFifo(path string, flag int) (*os.File, error) {
 	if path == "" {
 		return nil, nil
 	}
-	return os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
+	return os.OpenFile(path, flag, 0)
 }
 
 func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRequest) (_ *taskapi.CreateTaskResponse, err error) {
@@ -165,71 +174,107 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	t := &haikuTask{
-		id:     req.ID,
-		bundle: bundle,
-		spec:   spec,
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: stdout,
-		stderr: stderr,
-		waitCh: make(chan struct{}),
+	t := &proc{
+		id:         req.ID,
+		rootfs:     spec.Root.Path,
+		cwd:        spec.Process.Cwd,
+		env:        spec.Process.Env,
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
+		stdinPath:  req.Stdin,
+		stdoutPath: req.Stdout,
+		stderrPath: req.Stderr,
+		waitCh:     make(chan struct{}),
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start container init: %w", err)
 	}
 	t.pid = cmd.Process.Pid
 	s.tasks[req.ID] = t
-
-	// Reap the child and record the exit status.
-	go func() {
-		err := cmd.Wait()
-		t.exitedAt = time.Now()
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			t.exitStatus = uint32(exitErr.ExitCode())
-			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				t.exitStatus = uint32(128 + int(ws.Signal()))
-			}
-		} else if err != nil {
-			t.exitStatus = 255
-		}
-		t.exited = true
-		close(t.waitCh)
-		if s.publisher != nil {
-			evt := &eventtypes.TaskExit{
-				ContainerID: req.ID,
-				ID:          req.ID,
-				Pid:         uint32(t.pid),
-				ExitStatus:  t.exitStatus,
-				ExitedAt:    timestamppb.New(t.exitedAt),
-			}
-			// Best effort: the Wait response also carries the status.
-			_ = s.publisher.Publish(ctx, "/tasks/exit", evt)
-		}
-		if stdin != nil {
-			stdin.Close()
-		}
-		if stdout != nil {
-			stdout.Close()
-		}
-		if stderr != nil && stderr != stdout {
-			stderr.Close()
-		}
-	}()
+	go s.reap(ctx, t, req.ID, req.ID)
 
 	os.Stderr.WriteString(fmt.Sprintf("shim Create: spawned init pid=%d\n", t.pid))
 	return &taskapi.CreateTaskResponse{Pid: uint32(t.pid)}, nil
 }
 
+// spawn builds and starts an init-mode child for argv.
+func spawn(rootfs, cwd string, env, argv []string, stdin, stdout, stderr *os.File) (*exec.Cmd, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	argv0 := append([]string{filepath.Base(self), initFlag}, argv...)
+	_ = argv0
+	cmd := exec.Command(self, append([]string{initFlag}, argv...)...)
+	cmd.Dir = "/"
+	cmd.Env = append([]string{
+		envInitRootfs + "=" + rootfs,
+		envInitCwd + "=" + cwd,
+	}, env...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+// reap waits for a process, records its exit status, publishes the exit
+// event, and closes its stdio.
+func (s *haikuTaskService) reap(ctx context.Context, t *proc, containerID, eventID string) {
+	err := t.cmd.Wait()
+	t.exitedAt = time.Now()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		t.exitStatus = uint32(exitErr.ExitCode())
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			t.exitStatus = uint32(128 + int(ws.Signal()))
+		}
+	} else if err != nil {
+		t.exitStatus = 255
+	}
+	t.exited = true
+	close(t.waitCh)
+	if s.publisher != nil {
+		evt := &eventtypes.TaskExit{
+			ContainerID: containerID,
+			ID:          eventID,
+			Pid:         uint32(t.pid),
+			ExitStatus:  t.exitStatus,
+			ExitedAt:    timestamppb.New(t.exitedAt),
+		}
+		_ = s.publisher.Publish(ctx, "/tasks/exit", evt)
+	}
+	if t.stdin != nil {
+		t.stdin.Close()
+	}
+	if t.stdout != nil {
+		t.stdout.Close()
+	}
+	if t.stderr != nil && t.stderr != t.stdout {
+		t.stderr.Close()
+	}
+}
+
+// findProc returns the init or exec process for a request.
+func (s *haikuTaskService) findProc(containerID, execID string) *proc {
+	if execID == "" {
+		return s.tasks[containerID]
+	}
+	if m, ok := s.execs[containerID]; ok {
+		return m[execID]
+	}
+	return nil
+}
+
 func (s *haikuTaskService) Start(ctx context.Context, req *taskapi.StartRequest) (*taskapi.StartResponse, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
+	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
-	if !ok {
+	if t == nil {
 		return nil, fmt.Errorf("task %s not found", req.ID)
-	}
-	if req.ExecID != "" {
-		return nil, fmt.Errorf("exec not supported on haiku yet")
 	}
 	t.started = true
 	return &taskapi.StartResponse{Pid: uint32(t.pid)}, nil
@@ -237,9 +282,9 @@ func (s *haikuTaskService) Start(ctx context.Context, req *taskapi.StartRequest)
 
 func (s *haikuTaskService) State(ctx context.Context, req *taskapi.StateRequest) (*taskapi.StateResponse, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
+	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
-	if !ok {
+	if t == nil {
 		return nil, fmt.Errorf("task %s not found", req.ID)
 	}
 	status := tasktypes.Status_CREATED
@@ -249,10 +294,13 @@ func (s *haikuTaskService) State(ctx context.Context, req *taskapi.StateRequest)
 		status = tasktypes.Status_RUNNING
 	}
 	resp := &taskapi.StateResponse{
-		ID:         t.id,
+		ID:         req.ID,
+		ExecID:     req.ExecID,
 		Pid:        uint32(t.pid),
 		Status:     status,
-		Terminal:   t.spec.Process.Terminal,
+		Stdin:      t.stdinPath,
+		Stdout:     t.stdoutPath,
+		Stderr:     t.stderrPath,
 		ExitStatus: t.exitStatus,
 	}
 	if t.exited {
@@ -263,9 +311,9 @@ func (s *haikuTaskService) State(ctx context.Context, req *taskapi.StateRequest)
 
 func (s *haikuTaskService) Wait(ctx context.Context, req *taskapi.WaitRequest) (*taskapi.WaitResponse, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
+	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
-	if !ok {
+	if t == nil {
 		return nil, fmt.Errorf("task %s not found", req.ID)
 	}
 	select {
@@ -281,14 +329,13 @@ func (s *haikuTaskService) Wait(ctx context.Context, req *taskapi.WaitRequest) (
 
 func (s *haikuTaskService) Kill(ctx context.Context, req *taskapi.KillRequest) (*emptypb.Empty, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
+	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
-	if !ok {
+	if t == nil {
 		return nil, fmt.Errorf("task %s not found", req.ID)
 	}
 	sig := syscall.Signal(req.Signal)
 	if !t.exited && t.cmd.Process != nil {
-		// Signal the process group so children of the entrypoint die too.
 		_ = syscall.Kill(-t.pid, sig)
 		if err := t.cmd.Process.Signal(sig); err != nil {
 			return nil, err
@@ -299,12 +346,16 @@ func (s *haikuTaskService) Kill(ctx context.Context, req *taskapi.KillRequest) (
 
 func (s *haikuTaskService) Delete(ctx context.Context, req *taskapi.DeleteRequest) (*taskapi.DeleteResponse, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
-	if ok {
+	var t *proc
+	if req.ExecID == "" {
+		t = s.tasks[req.ID]
 		delete(s.tasks, req.ID)
+	} else if m, ok := s.execs[req.ID]; ok {
+		t = m[req.ExecID]
+		delete(m, req.ExecID)
 	}
 	s.mu.Unlock()
-	if !ok {
+	if t == nil {
 		return nil, fmt.Errorf("task %s not found", req.ID)
 	}
 	return &taskapi.DeleteResponse{
@@ -315,10 +366,11 @@ func (s *haikuTaskService) Delete(ctx context.Context, req *taskapi.DeleteReques
 }
 
 func (s *haikuTaskService) Shutdown(ctx context.Context, req *taskapi.ShutdownRequest) (*emptypb.Empty, error) {
-	// Exit the shim once the last task is gone; containerd sends
-	// Shutdown after Delete when stopping the shim.
 	s.mu.Lock()
 	remaining := len(s.tasks)
+	for _, m := range s.execs {
+		remaining += len(m)
+	}
 	s.mu.Unlock()
 	if remaining == 0 || req.Now {
 		go func() {
@@ -333,8 +385,75 @@ func (s *haikuTaskService) Connect(ctx context.Context, req *taskapi.ConnectRequ
 	return &taskapi.ConnectResponse{}, nil
 }
 
+// Exec runs an additional process in the container's rootfs, as an
+// init-mode child with the exec process spec.
 func (s *haikuTaskService) Exec(ctx context.Context, req *taskapi.ExecProcessRequest) (*emptypb.Empty, error) {
-	return nil, fmt.Errorf("exec not supported on haiku yet")
+	s.mu.Lock()
+	t := s.tasks[req.ID]
+	s.mu.Unlock()
+	if t == nil {
+		return nil, fmt.Errorf("task %s not found", req.ID)
+	}
+	if req.Spec == nil {
+		return nil, fmt.Errorf("exec %s: no process spec", req.ExecID)
+	}
+	v, err := typeurl.UnmarshalAny(req.Spec)
+	if err != nil {
+		return nil, fmt.Errorf("exec %s: decode spec: %w", req.ExecID, err)
+	}
+	pspec, ok := v.(*specs.Process)
+	if !ok {
+		return nil, fmt.Errorf("exec %s: spec is %T, not an OCI process", req.ExecID, v)
+	}
+	if len(pspec.Args) == 0 {
+		return nil, fmt.Errorf("exec %s: empty args", req.ExecID)
+	}
+
+	stdin, err := openFifo(req.Stdin, os.O_RDONLY)
+	if err != nil {
+		return nil, fmt.Errorf("open stdin fifo: %w", err)
+	}
+	stdout, err := openFifo(req.Stdout, os.O_WRONLY)
+	if err != nil {
+		return nil, fmt.Errorf("open stdout fifo: %w", err)
+	}
+	stderr := stdout
+	if req.Stderr != "" && req.Stderr != req.Stdout {
+		stderr, err = openFifo(req.Stderr, os.O_WRONLY)
+		if err != nil {
+			return nil, fmt.Errorf("open stderr fifo: %w", err)
+		}
+	}
+
+	p := &proc{
+		id:         req.ID,
+		execID:     req.ExecID,
+		rootfs:     t.rootfs,
+		cwd:        pspec.Cwd,
+		env:        pspec.Env,
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
+		stdinPath:  req.Stdin,
+		stdoutPath: req.Stdout,
+		stderrPath: req.Stderr,
+		waitCh:     make(chan struct{}),
+	}
+	cmd, err := spawn(t.rootfs, pspec.Cwd, pspec.Env, pspec.Args, stdin, stdout, stderr)
+	if err != nil {
+		return nil, fmt.Errorf("exec %s: %w", req.ExecID, err)
+	}
+	p.cmd = cmd
+	p.pid = cmd.Process.Pid
+	p.started = true
+	s.mu.Lock()
+	if s.execs[req.ID] == nil {
+		s.execs[req.ID] = make(map[string]*proc)
+	}
+	s.execs[req.ID][req.ExecID] = p
+	s.mu.Unlock()
+	go s.reap(ctx, p, req.ID, req.ExecID)
+	return &emptypb.Empty{}, nil
 }
 
 func (s *haikuTaskService) ResizePty(ctx context.Context, req *taskapi.ResizePtyRequest) (*emptypb.Empty, error) {
@@ -343,9 +462,9 @@ func (s *haikuTaskService) ResizePty(ctx context.Context, req *taskapi.ResizePty
 
 func (s *haikuTaskService) CloseIO(ctx context.Context, req *taskapi.CloseIORequest) (*emptypb.Empty, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
+	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
-	if ok && req.Stdin && t.stdin != nil {
+	if t != nil && req.Stdin && t.stdin != nil {
 		_ = t.stdin.Close()
 	}
 	return &emptypb.Empty{}, nil
@@ -353,14 +472,15 @@ func (s *haikuTaskService) CloseIO(ctx context.Context, req *taskapi.CloseIORequ
 
 func (s *haikuTaskService) Pids(ctx context.Context, req *taskapi.PidsRequest) (*taskapi.PidsResponse, error) {
 	s.mu.Lock()
-	t, ok := s.tasks[req.ID]
-	s.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("task %s not found", req.ID)
+	defer s.mu.Unlock()
+	resp := &taskapi.PidsResponse{}
+	if t := s.tasks[req.ID]; t != nil {
+		resp.Processes = append(resp.Processes, &taskpb.ProcessInfo{Pid: uint32(t.pid)})
 	}
-	return &taskapi.PidsResponse{
-		Processes: []*taskpb.ProcessInfo{{Pid: uint32(t.pid)}},
-	}, nil
+	for _, p := range s.execs[req.ID] {
+		resp.Processes = append(resp.Processes, &taskpb.ProcessInfo{Pid: uint32(p.pid)})
+	}
+	return resp, nil
 }
 
 func (s *haikuTaskService) Pause(ctx context.Context, req *taskapi.PauseRequest) (*emptypb.Empty, error) {

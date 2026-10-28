@@ -23,6 +23,7 @@ import (
 
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/core/events"
+	_ "github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/plugin"
