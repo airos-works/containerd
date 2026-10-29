@@ -1,4 +1,4 @@
-//go:build !freebsd
+//go:build !freebsd && !haiku
 
 /*
    Copyright The containerd Authors.
