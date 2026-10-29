@@ -20,9 +20,9 @@ package main
 
 import (
 	"context"
-	"io"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,15 +32,14 @@ import (
 	"unsafe"
 
 	eventtypes "github.com/containerd/containerd/api/events"
-	taskpb "github.com/containerd/containerd/api/types/task"
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	taskpb "github.com/containerd/containerd/api/types/task"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/core/events"
-	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // proc is any supervised process: a container init or an exec process.
@@ -68,8 +67,9 @@ type proc struct {
 	stderrPath string
 
 	// Terminal state: master is the pty master; the child holds the slave.
-	master   *os.File
-	ptySlave *os.File
+	// ptyDone closes once the pty's output has all been copied to stdout.
+	master  *os.File
+	ptyDone chan struct{}
 
 	waitCh chan struct{}
 }
@@ -92,46 +92,84 @@ func newHaikuTaskService(publisher events.Publisher) *haikuTaskService {
 	}
 }
 
-// ptySlaveFile holds the slave side between openPty and spawn (package
-// level because openPty runs before the child command is built).
-var ptySlaveFile *os.File
-
-// openPty allocates a pty master/slave pair (Haiku /dev/tt/pN).
-func openPty() (*os.File, error) {
-	mfd, err := syscall.PosixOpenpt(syscall.O_RDWR | 0x20000 /* O_NOCTTY */)
+// openPty allocates a pty master/slave pair (Haiku /dev/tt/pN). Both ends
+// are opened with O_NOCTTY: Haiku's pty driver refuses to open a slave as
+// the opener's controlling terminal unless it leads a session, and the
+// terminal belongs to the container process (see ttyAttr), not the shim.
+func openPty() (master, slave *os.File, _ error) {
+	mfd, err := syscall.PosixOpenpt(syscall.O_RDWR | syscall.O_NOCTTY)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := syscall.Grantpt(mfd); err != nil {
 		syscall.Close(mfd)
-		return nil, err
+		return nil, nil, err
 	}
 	if err := syscall.Unlockpt(mfd); err != nil {
 		syscall.Close(mfd)
-		return nil, err
+		return nil, nil, err
 	}
 	name, err := syscall.Ptsname(mfd)
 	if err != nil {
 		syscall.Close(mfd)
-		return nil, err
+		return nil, nil, err
 	}
-	slave, err := os.OpenFile(name, os.O_RDWR, 0)
+	slave, err = os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY, 0)
 	if err != nil {
 		syscall.Close(mfd)
-		return nil, err
+		return nil, nil, err
 	}
-	ptySlaveFile = slave
-	return os.NewFile(uintptr(mfd), "ptymaster"), nil
+	return os.NewFile(uintptr(mfd), "ptymaster"), slave, nil
 }
 
-// pumpPty copies between the pty master and the client's fifos until EOF.
-func pumpPty(master, stdin, stdout *os.File) {
+// pumpPty copies between the pty master and the client's fifos. The
+// returned channel closes when the output side ends: the shim closes its
+// slave once the child has it, so that happens when the container's
+// processes have all closed the terminal.
+func pumpPty(master, stdin, stdout *os.File) chan struct{} {
+	if stdin != nil {
+		go func() {
+			_, _ = io.Copy(master, stdin)
+		}()
+	}
+	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(master, stdin)
+		defer close(done)
+		var out io.Writer = io.Discard
+		if stdout != nil {
+			out = stdout
+		}
+		_, _ = io.Copy(out, master)
 	}()
-	go func() {
-		_, _ = io.Copy(stdout, master)
-	}()
+	return done
+}
+
+// ttyAttr starts a process on a pty in its own session, with the pty
+// (its stdin) as its controlling terminal, so that job control and the
+// terminal's signals (^C, ^Z) reach it.
+var ttyAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+
+// procAttr starts a container process as the leader of its own process
+// group (a session, on a pty), which the teams it starts join: Kill signals
+// the group, and when the init exits its group goes with it.
+func procAttr(tty bool) *syscall.SysProcAttr {
+	if tty {
+		return ttyAttr
+	}
+	return &syscall.SysProcAttr{Setpgid: true}
+}
+
+// waitPty waits briefly for a terminal's remaining output to reach the
+// client before its stdio is closed; a background process that keeps the
+// terminal open must not hold up the exit.
+func waitPty(t *proc) {
+	if t.ptyDone == nil {
+		return
+	}
+	select {
+	case <-t.ptyDone:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 // haikuWinsize matches struct winsize in termios.h.
@@ -192,6 +230,9 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	if spec.Process == nil || len(spec.Process.Args) == 0 {
 		return nil, fmt.Errorf("spec has no process args")
 	}
+	if err := linkBindMounts(spec.Root.Path, spec.Mounts); err != nil {
+		return nil, err
+	}
 
 	// Stdio: containerd created fifos for each non-empty stream. Opening
 	// them blocks until the client attaches; the daemon does this before
@@ -213,15 +254,15 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	}
 
 	childStdin, childStdout, childStderr := stdin, stdout, stderr
-	var master *os.File
+	var master, slave *os.File
 	if req.Terminal {
-		master, err = openPty()
+		master, slave, err = openPty()
 		if err != nil {
 			return nil, fmt.Errorf("allocate pty: %w", err)
 		}
-		childStdin = ptySlaveFile
-		childStdout = ptySlaveFile
-		childStderr = ptySlaveFile
+		childStdin = slave
+		childStdout = slave
+		childStderr = slave
 	}
 
 	self, err := os.Executable()
@@ -238,6 +279,7 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	cmd.Stdin = childStdin
 	cmd.Stdout = childStdout
 	cmd.Stderr = childStderr
+	cmd.SysProcAttr = procAttr(slave != nil)
 
 	t := &proc{
 		id:         req.ID,
@@ -252,16 +294,22 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 		stdoutPath: req.Stdout,
 		stderrPath: req.Stderr,
 		master:     master,
-		ptySlave:   ptySlaveFile,
 		waitCh:     make(chan struct{}),
 	}
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	if slave != nil {
+		slave.Close()
+	}
+	if err != nil {
+		if master != nil {
+			master.Close()
+		}
 		return nil, fmt.Errorf("start container init: %w", err)
 	}
 	t.pid = cmd.Process.Pid
 	s.tasks[req.ID] = t
 	if master != nil {
-		go pumpPty(master, t.stdin, t.stdout)
+		t.ptyDone = pumpPty(master, t.stdin, t.stdout)
 	}
 	go s.reap(ctx, t, req.ID, req.ID)
 
@@ -269,8 +317,9 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	return &taskapi.CreateTaskResponse{Pid: uint32(t.pid)}, nil
 }
 
-// spawn builds and starts an init-mode child for argv.
-func spawn(rootfs, cwd string, env, argv []string, stdin, stdout, stderr *os.File) (*exec.Cmd, error) {
+// spawn builds and starts an init-mode child for argv; tty starts it on a
+// pty (stdin) as its controlling terminal.
+func spawn(rootfs, cwd string, env, argv []string, stdin, stdout, stderr *os.File, tty bool) (*exec.Cmd, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -286,6 +335,7 @@ func spawn(rootfs, cwd string, env, argv []string, stdin, stdout, stderr *os.Fil
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.SysProcAttr = procAttr(tty)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -305,6 +355,10 @@ func (s *haikuTaskService) reap(ctx context.Context, t *proc, containerID, event
 	} else if err != nil {
 		t.exitStatus = 255
 	}
+	if eventID == containerID {
+		s.killRemaining(containerID, t)
+	}
+	waitPty(t)
 	t.exited = true
 	close(t.waitCh)
 	if s.publisher != nil {
@@ -315,7 +369,9 @@ func (s *haikuTaskService) reap(ctx context.Context, t *proc, containerID, event
 			ExitStatus:  t.exitStatus,
 			ExitedAt:    timestamppb.New(t.exitedAt),
 		}
-		_ = s.publisher.Publish(ctx, "/tasks/exit", evt)
+		// ctx is the Create or Exec request's, long cancelled by now; the
+		// publisher retries with it, so it must outlive the request.
+		_ = s.publisher.Publish(context.WithoutCancel(ctx), "/tasks/exit", evt)
 	}
 	if t.stdin != nil {
 		t.stdin.Close()
@@ -326,11 +382,27 @@ func (s *haikuTaskService) reap(ctx context.Context, t *proc, containerID, event
 	if t.stderr != nil && t.stderr != t.stdout {
 		t.stderr.Close()
 	}
-	if t.ptySlave != nil {
-		t.ptySlave.Close()
-	}
 	if t.master != nil {
 		t.master.Close()
+	}
+}
+
+// killRemaining kills what is left of a container once its init exits, as
+// Linux does when a pid namespace's init dies: the teams in the init's
+// process group, and each exec process with its group.
+func (s *haikuTaskService) killRemaining(containerID string, init *proc) {
+	_ = syscall.Kill(-init.pid, syscall.SIGKILL)
+	s.mu.Lock()
+	var execs []*proc
+	for _, p := range s.execs[containerID] {
+		if !p.exited && p.cmd != nil && p.cmd.Process != nil {
+			execs = append(execs, p)
+		}
+	}
+	s.mu.Unlock()
+	for _, p := range execs {
+		_ = syscall.Kill(-p.pid, syscall.SIGKILL)
+		_ = p.cmd.Process.Kill()
 	}
 }
 
@@ -426,6 +498,7 @@ func (s *haikuTaskService) Delete(ctx context.Context, req *taskapi.DeleteReques
 	if req.ExecID == "" {
 		t = s.tasks[req.ID]
 		delete(s.tasks, req.ID)
+		delete(s.execs, req.ID) // its execs went with it (see killRemaining)
 	} else if m, ok := s.execs[req.ID]; ok {
 		t = m[req.ExecID]
 		delete(m, req.ExecID)
@@ -442,11 +515,10 @@ func (s *haikuTaskService) Delete(ctx context.Context, req *taskapi.DeleteReques
 }
 
 func (s *haikuTaskService) Shutdown(ctx context.Context, req *taskapi.ShutdownRequest) (*emptypb.Empty, error) {
+	// Exec processes belong to their container: once its init task is
+	// deleted they are gone too (as in the runc shim).
 	s.mu.Lock()
 	remaining := len(s.tasks)
-	for _, m := range s.execs {
-		remaining += len(m)
-	}
 	s.mu.Unlock()
 	if remaining == 0 || req.Now {
 		go func() {
@@ -515,9 +587,29 @@ func (s *haikuTaskService) Exec(ctx context.Context, req *taskapi.ExecProcessReq
 		stderrPath: req.Stderr,
 		waitCh:     make(chan struct{}),
 	}
-	cmd, err := spawn(t.rootfs, pspec.Cwd, pspec.Env, pspec.Args, stdin, stdout, stderr)
+	childStdin, childStdout, childStderr := stdin, stdout, stderr
+	var slave *os.File
+	if req.Terminal || pspec.Terminal {
+		p.master, slave, err = openPty()
+		if err != nil {
+			return nil, fmt.Errorf("exec %s: allocate pty: %w", req.ExecID, err)
+		}
+		childStdin = slave
+		childStdout = slave
+		childStderr = slave
+	}
+	cmd, err := spawn(t.rootfs, pspec.Cwd, pspec.Env, pspec.Args, childStdin, childStdout, childStderr, slave != nil)
+	if slave != nil {
+		slave.Close()
+	}
 	if err != nil {
+		if p.master != nil {
+			p.master.Close()
+		}
 		return nil, fmt.Errorf("exec %s: %w", req.ExecID, err)
+	}
+	if p.master != nil {
+		p.ptyDone = pumpPty(p.master, stdin, stdout)
 	}
 	p.cmd = cmd
 	p.pid = cmd.Process.Pid
@@ -557,17 +649,32 @@ func (s *haikuTaskService) CloseIO(ctx context.Context, req *taskapi.CloseIORequ
 	return &emptypb.Empty{}, nil
 }
 
+// Pids lists the container's processes: its init and exec processes and
+// every team they started (docker top shows them all, as on Linux).
 func (s *haikuTaskService) Pids(ctx context.Context, req *taskapi.PidsRequest) (*taskapi.PidsResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	roots := s.rootTeams(req.ID)
+	s.mu.Unlock()
 	resp := &taskapi.PidsResponse{}
-	if t := s.tasks[req.ID]; t != nil {
-		resp.Processes = append(resp.Processes, &taskpb.ProcessInfo{Pid: uint32(t.pid)})
-	}
-	for _, p := range s.execs[req.ID] {
-		resp.Processes = append(resp.Processes, &taskpb.ProcessInfo{Pid: uint32(p.pid)})
+	for _, team := range teamTree(roots) {
+		resp.Processes = append(resp.Processes, &taskpb.ProcessInfo{Pid: uint32(team)})
 	}
 	return resp, nil
+}
+
+// rootTeams returns the running init and exec processes of a container;
+// s.mu must be held.
+func (s *haikuTaskService) rootTeams(id string) []int32 {
+	var roots []int32
+	if t := s.tasks[id]; t != nil && !t.exited {
+		roots = append(roots, int32(t.pid))
+	}
+	for _, p := range s.execs[id] {
+		if !p.exited {
+			roots = append(roots, int32(p.pid))
+		}
+	}
+	return roots
 }
 
 func (s *haikuTaskService) Pause(ctx context.Context, req *taskapi.PauseRequest) (*emptypb.Empty, error) {
@@ -583,7 +690,18 @@ func (s *haikuTaskService) Checkpoint(ctx context.Context, req *taskapi.Checkpoi
 }
 
 func (s *haikuTaskService) Stats(ctx context.Context, req *taskapi.StatsRequest) (*taskapi.StatsResponse, error) {
-	return &taskapi.StatsResponse{Stats: &anypb.Any{}}, nil
+	s.mu.Lock()
+	t := s.tasks[req.ID]
+	roots := s.rootTeams(req.ID)
+	s.mu.Unlock()
+	if t == nil {
+		return nil, fmt.Errorf("task %s not found", req.ID)
+	}
+	stats, err := typeurl.MarshalAnyToProto(teamMetrics(roots))
+	if err != nil {
+		return nil, err
+	}
+	return &taskapi.StatsResponse{Stats: stats}, nil
 }
 
 func (s *haikuTaskService) Update(ctx context.Context, req *taskapi.UpdateTaskRequest) (*emptypb.Empty, error) {
