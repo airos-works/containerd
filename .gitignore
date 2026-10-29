@@ -1,4 +1,4 @@
 artifacts/
 build/
-containerd-shim-haiku-v2
+/containerd-shim-haiku-v2
 /containerd
