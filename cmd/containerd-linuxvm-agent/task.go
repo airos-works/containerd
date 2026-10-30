@@ -230,6 +230,18 @@ func (s *taskService) Create(ctx context.Context, req *taskapi.CreateTaskRequest
 		}
 	}()
 
+	// The stdio streams first: they are already here, and wait to be claimed.
+	p := &process{id: req.ID, terminal: req.Terminal || spec.Process.Terminal, done: make(chan struct{}),
+		stdinPath: req.Stdin, stdoutPath: req.Stdout, stderrPath: req.Stderr}
+	if err := s.claimIO(ctx, p, req.Stdin, req.Stdout, req.Stderr); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			p.closeIO()
+		}
+	}()
+
 	c := &container{id: req.ID, bundle: bundle, spec: spec, execs: make(map[string]*process)}
 	if err := s.prepareSpec(ctx, c); err != nil {
 		return nil, fmt.Errorf("create %s: %w", req.ID, err)
@@ -242,11 +254,6 @@ func (s *taskService) Create(ctx context.Context, req *taskapi.CreateTaskRequest
 		return nil, err
 	}
 
-	p := &process{id: req.ID, terminal: req.Terminal || spec.Process.Terminal, done: make(chan struct{}),
-		stdinPath: req.Stdin, stdoutPath: req.Stdout, stderrPath: req.Stderr}
-	if err := s.claimIO(ctx, p, req.Stdin, req.Stdout, req.Stderr); err != nil {
-		return nil, err
-	}
 	r := newRunc()
 	r.Log, r.LogFormat = filepath.Join(bundle, "log.json"), runc.JSON
 	opts := &runc.CreateOpts{PidFile: filepath.Join(bundle, "init.pid")}
@@ -263,7 +270,6 @@ func (s *taskService) Create(ctx context.Context, req *taskapi.CreateTaskRequest
 		opts.IO = p.rio
 	}
 	if err := r.Create(ctx, req.ID, bundle, opts); err != nil {
-		p.closeIO()
 		return nil, fmt.Errorf("runc create: %w%s", err, runcLog(bundle))
 	}
 	if err := s.startIO(p, sock); err != nil {

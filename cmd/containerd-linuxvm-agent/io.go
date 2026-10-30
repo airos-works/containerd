@@ -56,8 +56,9 @@ func (r *ioStreams) register(token string, st *mux.Stream) {
 		return
 	}
 	r.streams[token] = st
-	// a stream no request claims must not linger
-	time.AfterFunc(time.Minute, func() {
+	// A stream no request claims must not linger; on an emulated VM the
+	// request can take minutes to follow.
+	time.AfterFunc(10*time.Minute, func() {
 		r.mu.Lock()
 		if s, ok := r.streams[token]; ok && s == st {
 			delete(r.streams, token)
