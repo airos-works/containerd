@@ -62,6 +62,9 @@ func main() {
 
 	svc := newTaskService()
 	port, err := openAgentPort()
+	if err == nil {
+		logf("ready: serving the host on %s", port.Name())
+	}
 	if err != nil {
 		logf("%v", err)
 		_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)

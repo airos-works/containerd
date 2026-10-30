@@ -39,8 +39,10 @@ const switchedEnv = "LINUXVM_SWITCHED_ROOT"
 // files over virtio-9p, and the VM's network.
 func initVM() error {
 	if os.Getenv(switchedEnv) == "" {
+		logf("moving the root file system to a tmpfs")
 		return switchRoot()
 	}
+	logf("mounting the kernel file systems")
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
 	mounts := []struct {
@@ -82,6 +84,7 @@ func initVM() error {
 		_ = os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control", []byte(strings.Join(enable, " ")), 0o644)
 	}
 
+	logf("mounting the host's files")
 	// The host's root directory, twice (a virtio 9p device mounts once).
 	// cache=mmap keeps what the host changes (an edited bind-mounted
 	// source file) visible at once, and still lets containers mmap their
@@ -115,6 +118,7 @@ func initVM() error {
 	} {
 		_ = os.WriteFile(s.path, []byte(s.value), 0o644)
 	}
+	logf("configuring the network")
 	if err := setupVMNetwork(); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
