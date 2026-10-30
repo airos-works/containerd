@@ -470,9 +470,12 @@ func dialRetry(path string, exited <-chan struct{}, timeout time.Duration) (net.
 	}
 }
 
-// ping waits until the agent answers on a fresh stream.
+// ping waits until the agent answers. Each attempt waits longer for the
+// pong (from a second to 30): an emulated VM answers slowly, and attempts
+// given up too soon only queue more work for it.
 func ping(sess *mux.Session, exited <-chan struct{}, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	wait := time.Second
 	for time.Now().Before(deadline) {
 		select {
 		case <-exited:
@@ -483,14 +486,15 @@ func ping(sess *mux.Session, exited <-chan struct{}, timeout time.Duration) erro
 		if err != nil {
 			return err
 		}
-		_ = st.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = st.SetReadDeadline(time.Now().Add(wait))
 		line, err := bufio.NewReader(st).ReadString('\n')
 		st.Close()
 		if err == nil && strings.TrimSpace(line) == "pong" {
 			return nil
 		}
-		// Until the guest opens its port, what we sent is dropped: ask again.
-		time.Sleep(100 * time.Millisecond)
+		// Until the guest opens its port, what we sent waits: ask again,
+		// and wait longer.
+		wait = min(wait*2, 30*time.Second)
 	}
 	return errors.New("timed out")
 }

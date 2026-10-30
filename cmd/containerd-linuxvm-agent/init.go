@@ -20,13 +20,9 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/containerd/containerd/v2/pkg/linuxvm"
 	"golang.org/x/sys/unix"
@@ -39,8 +35,10 @@ const switchedEnv = "LINUXVM_SWITCHED_ROOT"
 // files over virtio-9p, and the VM's network.
 func initVM() error {
 	if os.Getenv(switchedEnv) == "" {
-		logf("moving the root file system to a tmpfs")
-		return switchRoot()
+		logf("making the root a mount of its own")
+		if err := switchRoot(); err != nil {
+			return err
+		}
 	}
 	logf("mounting the kernel file systems")
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -125,42 +123,17 @@ func initVM() error {
 	return nil
 }
 
-// switchRoot copies the initramfs to a tmpfs and makes that the root:
-// runc's pivot_root cannot leave the initial rootfs.
+// switchRoot makes the root a mount runc can pivot_root away from: the
+// initial rootfs cannot be, but a bind mount of it moved over it can, and
+// costs nothing (copying the initramfs to a tmpfs took most of an emulated
+// VM's start-up).
 func switchRoot() error {
 	const newRoot = "/sysroot"
 	if err := os.MkdirAll(newRoot, 0o755); err != nil {
 		return err
 	}
-	if err := unix.Mount("rootfs", newRoot, "tmpfs", 0, "mode=0755"); err != nil {
-		return err
-	}
-	err := filepath.WalkDir("/", func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if p == newRoot || p == "/proc" || p == "/sys" || p == "/dev" {
-			if p != "/" {
-				_ = os.MkdirAll(newRoot+p, 0o755)
-				return filepath.SkipDir
-			}
-		}
-		if p == "/" {
-			return nil
-		}
-		return copyEntry(p, newRoot+p, d)
-	})
-	if err != nil {
-		return fmt.Errorf("copy root: %w", err)
-	}
-	// Free the old root's memory: nothing on it is needed any more.
-	entries, _ := os.ReadDir("/")
-	for _, e := range entries {
-		switch e.Name() {
-		case "sysroot", "proc", "sys", "dev":
-			continue
-		}
-		_ = os.RemoveAll("/" + e.Name())
+	if err := unix.Mount("/", newRoot, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind the root: %w", err)
 	}
 	if err := unix.Chdir(newRoot); err != nil {
 		return err
@@ -174,60 +147,7 @@ func switchRoot() error {
 	if err := unix.Chdir("/"); err != nil {
 		return err
 	}
-	exe := "/init"
-	if _, err := os.Stat(exe); err != nil {
-		exe = "/sbin/containerd-linuxvm-agent"
-	}
-	return syscall.Exec(exe, os.Args, append(os.Environ(), switchedEnv+"=1"))
-}
-
-func copyEntry(src, dst string, d fs.DirEntry) error {
-	info, err := os.Lstat(src)
-	if err != nil {
-		return err
-	}
-	st := info.Sys().(*syscall.Stat_t)
-	switch mode := info.Mode(); {
-	case mode.IsDir():
-		if err := os.Mkdir(dst, mode.Perm()); err != nil && !os.IsExist(err) {
-			return err
-		}
-	case mode&os.ModeSymlink != 0:
-		target, err := os.Readlink(src)
-		if err != nil {
-			return err
-		}
-		if err := os.Symlink(target, dst); err != nil {
-			return err
-		}
-	case mode.IsRegular():
-		in, err := os.Open(src)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, mode.Perm())
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(out, in); err != nil {
-			out.Close()
-			return err
-		}
-		if err := out.Close(); err != nil {
-			return err
-		}
-	default:
-		if err := unix.Mknod(dst, st.Mode, int(st.Rdev)); err != nil {
-			return err
-		}
-	}
-	_ = os.Lchown(dst, int(st.Uid), int(st.Gid))
-	if info.Mode()&os.ModeSymlink == 0 {
-		// setuid and friends: Mkdir and OpenFile drop them
-		_ = unix.Chmod(dst, st.Mode&07777)
-	}
-	return nil
+	return os.Setenv(switchedEnv, "1")
 }
 
 // run runs a helper program from the VM's userland.

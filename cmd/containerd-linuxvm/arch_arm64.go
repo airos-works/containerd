@@ -27,9 +27,11 @@ func machineType(accel string) string {
 	return "virt"
 }
 
+// Under TCG, an ARMv8.2 core with LSE atomics but no SVE, SME or MTE: their
+// state costs every context switch, and nothing in the VM needs them.
 func cpuModel(accel string) string {
 	if accel == "tcg" {
-		return "max"
+		return "neoverse-n1"
 	}
 	return "host"
 }
