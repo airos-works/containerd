@@ -3,6 +3,7 @@
 package mount
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +12,28 @@ import (
 	"github.com/containerd/errdefs"
 )
 
-// Mount is not implemented on Haiku; the Engine realizes snapshot mounts
-// itself (symlink alias or bfs volume) in daemon/snapshotter.
+// Haiku has no bind mounts. A bind mount (what the native snapshotter
+// returns) becomes a symlink alias of its source at the target, which
+// unmount removes again; anything else is not implemented. The Engine
+// realizes container root file systems itself (daemon/snapshotter).
 func (m *Mount) mount(target string) error {
-	return errdefs.ErrNotImplemented
+	bind := m.Type == "bind"
+	for _, o := range m.Options {
+		bind = bind || o == "bind" || o == "rbind"
+	}
+	if !bind {
+		return errdefs.ErrNotImplemented
+	}
+	if fi, err := os.Lstat(target); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("mount target %s: not a directory", target)
+		}
+		// an empty mount point (os.MkdirTemp) gives way to the alias
+		if err := os.Remove(target); err != nil {
+			return fmt.Errorf("mount target %s: %w", target, err)
+		}
+	}
+	return os.Symlink(m.Source, target)
 }
 
 // unmount removes the realization of a mount point: a symlink alias is

@@ -97,7 +97,7 @@ func main() {
 	switch flag.Arg(0) {
 	case "run":
 		os.Exit(runContainer(cfg.socket, flag.Args()[1:]))
-	case "status", "stop":
+	case "status", "stop", "debug":
 		os.Exit(request(cfg.socket, flag.Arg(0)))
 	}
 	readSettings(&cfg)
@@ -242,6 +242,12 @@ func (v *vm) handle(c net.Conn) {
 	case "stop":
 		v.stop()
 		_, _ = io.WriteString(c, "stopped\n")
+		c.Close()
+		return
+	case "debug":
+		// every goroutine's stack, to see what a stuck supervisor waits on
+		buf := make([]byte, 1<<20)
+		_, _ = c.Write(buf[:runtime.Stack(buf, true)])
 		c.Close()
 		return
 	}
