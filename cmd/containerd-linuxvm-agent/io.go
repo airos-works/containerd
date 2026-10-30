@@ -90,7 +90,7 @@ func (r *ioStreams) claim(ctx context.Context, name string) (*mux.Stream, error)
 	case st := <-w:
 		return st, nil
 	case <-ctx.Done():
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Minute): // minutes on an emulated VM
 	}
 	r.mu.Lock()
 	delete(r.waiters, token)
