@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/linuxvm"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 // The VM's own uplink: QEMU's user-mode network.
@@ -296,7 +297,9 @@ func plugVeth(ep *endpoint, pid, index int, bn *bridgeNet) error {
 		return err
 	}
 	defer ns.Close()
-	h, err := netlink.NewHandleAt(ns)
+	// routing only: a handle for every family needs XFRM, which the arm64
+	// kernel does not build
+	h, err := netlink.NewHandleAt(ns, unix.NETLINK_ROUTE)
 	if err != nil {
 		return err
 	}
