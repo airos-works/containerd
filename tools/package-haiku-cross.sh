@@ -18,16 +18,17 @@ for arch in "${@:-amd64 arm64}"; do
     [ "$arch" = "amd64" ] && haiku_arch=x86_64
     bin="build/haiku-$arch/containerd"
     [ -f "$bin" ] || { echo ">> building $arch first"; bash tools/build-haiku.sh "$arch"; }
-    rm -rf "$STAGE/bin/containerd" "$STAGE/bin/containerd-shim-runc-v2" "$STAGE/.PackageInfo"
+    rm -rf "$STAGE/bin/containerd" "$STAGE/bin/containerd-shim-runc-v2" "$STAGE/bin/containerd-linuxvm" "$STAGE/.PackageInfo"
     cp "$bin" "$STAGE/bin/containerd"
     cp "build/haiku-$arch/containerd-shim-runc-v2" "$STAGE/bin/containerd-shim-runc-v2"
+    cp "build/haiku-$arch/containerd-linuxvm" "$STAGE/bin/containerd-linuxvm"
     cp docs/airos.md "$STAGE/documentation/packages/containerd/"
     cat > "$STAGE/.PackageInfo" <<PKGEOF
 name containerd
 version $VERSION-1
 architecture $haiku_arch
 summary "containerd for air/OS"
-description "The containerd daemon for air/OS, ported from the open-source containerd project. Serves the Docker Engine (airos-works/moby) with content, image and snapshot services; the vfs snapshotter operates without kernel mounts."
+description "The containerd daemon for air/OS, ported from the open-source containerd project. Serves the Docker Engine (airos-works/moby) with content, image and snapshot services; the vfs snapshotter operates without kernel mounts. Its shim runs Haiku containers natively and Linux containers in the Linux VM (the linuxvm package), which containerd-linuxvm starts on demand."
 packager "air/OS contributors"
 vendor "air/OS"
 copyrights { "2026 air/OS contributors" "The containerd Authors" }
@@ -36,6 +37,7 @@ provides {
     containerd = $VERSION
     cmd:containerd = $VERSION
     cmd:containerd_shim_runc_v2 = $VERSION
+    cmd:containerd_linuxvm = $VERSION
 }
 requires {
     haiku >= r1~beta5

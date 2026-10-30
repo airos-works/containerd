@@ -81,6 +81,7 @@ type haikuTaskService struct {
 	mu        sync.Mutex
 	tasks     map[string]*proc
 	execs     map[string]map[string]*proc // container id -> exec id -> proc
+	linux     map[string]*linuxContainer  // containers in the Linux VM (linux.go)
 	publisher events.Publisher
 }
 
@@ -88,6 +89,7 @@ func newHaikuTaskService(publisher events.Publisher) *haikuTaskService {
 	return &haikuTaskService{
 		tasks:     make(map[string]*proc),
 		execs:     make(map[string]map[string]*proc),
+		linux:     make(map[string]*linuxContainer),
 		publisher: publisher,
 	}
 }
@@ -211,6 +213,14 @@ func (s *haikuTaskService) Create(ctx context.Context, req *taskapi.CreateTaskRe
 	}()
 	os.Stderr.WriteString(fmt.Sprintf("shim Create: id=%s bundle=%s stdin=%s stdout=%s stderr=%s\n",
 		req.ID, req.Bundle, req.Stdin, req.Stdout, req.Stderr))
+	if req.Bundle != "" {
+		if spec, err := loadSpec(req.Bundle); err == nil && isLinuxSpec(spec) {
+			if s.linuxContainerFor(req.ID) != nil {
+				return nil, fmt.Errorf("task %s already exists", req.ID)
+			}
+			return s.createLinux(ctx, req, spec)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.tasks[req.ID]; exists {
@@ -418,6 +428,9 @@ func (s *haikuTaskService) findProc(containerID, execID string) *proc {
 }
 
 func (s *haikuTaskService) Start(ctx context.Context, req *taskapi.StartRequest) (*taskapi.StartResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return s.startLinux(ctx, c, req)
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -429,6 +442,9 @@ func (s *haikuTaskService) Start(ctx context.Context, req *taskapi.StartRequest)
 }
 
 func (s *haikuTaskService) State(ctx context.Context, req *taskapi.StateRequest) (*taskapi.StateResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return s.stateLinux(ctx, c, req)
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -458,6 +474,9 @@ func (s *haikuTaskService) State(ctx context.Context, req *taskapi.StateRequest)
 }
 
 func (s *haikuTaskService) Wait(ctx context.Context, req *taskapi.WaitRequest) (*taskapi.WaitResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return s.waitLinuxReq(ctx, c, req)
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -476,6 +495,11 @@ func (s *haikuTaskService) Wait(ctx context.Context, req *taskapi.WaitRequest) (
 }
 
 func (s *haikuTaskService) Kill(ctx context.Context, req *taskapi.KillRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Kill(ctx, &taskapi.KillRequest{
+			ID: req.ID, ExecID: req.ExecID, Signal: linuxSignal(req.Signal), All: req.All,
+		})
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -493,6 +517,9 @@ func (s *haikuTaskService) Kill(ctx context.Context, req *taskapi.KillRequest) (
 }
 
 func (s *haikuTaskService) Delete(ctx context.Context, req *taskapi.DeleteRequest) (*taskapi.DeleteResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return s.deleteLinux(ctx, c, req)
+	}
 	s.mu.Lock()
 	var t *proc
 	if req.ExecID == "" {
@@ -518,7 +545,7 @@ func (s *haikuTaskService) Shutdown(ctx context.Context, req *taskapi.ShutdownRe
 	// Exec processes belong to their container: once its init task is
 	// deleted they are gone too (as in the runc shim).
 	s.mu.Lock()
-	remaining := len(s.tasks)
+	remaining := len(s.tasks) + len(s.linux)
 	s.mu.Unlock()
 	if remaining == 0 || req.Now {
 		go func() {
@@ -536,6 +563,9 @@ func (s *haikuTaskService) Connect(ctx context.Context, req *taskapi.ConnectRequ
 // Exec runs an additional process in the container's rootfs, as an
 // init-mode child with the exec process spec.
 func (s *haikuTaskService) Exec(ctx context.Context, req *taskapi.ExecProcessRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return s.execLinux(ctx, c, req)
+	}
 	s.mu.Lock()
 	t := s.tasks[req.ID]
 	s.mu.Unlock()
@@ -625,6 +655,9 @@ func (s *haikuTaskService) Exec(ctx context.Context, req *taskapi.ExecProcessReq
 }
 
 func (s *haikuTaskService) ResizePty(ctx context.Context, req *taskapi.ResizePtyRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.ResizePty(ctx, req)
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -640,6 +673,11 @@ func (s *haikuTaskService) ResizePty(ctx context.Context, req *taskapi.ResizePty
 }
 
 func (s *haikuTaskService) CloseIO(ctx context.Context, req *taskapi.CloseIORequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		// stdin's stream ends when the fifo does; the agent closes the
+		// process's stdin then
+		return &emptypb.Empty{}, nil
+	}
 	s.mu.Lock()
 	t := s.findProc(req.ID, req.ExecID)
 	s.mu.Unlock()
@@ -652,6 +690,9 @@ func (s *haikuTaskService) CloseIO(ctx context.Context, req *taskapi.CloseIORequ
 // Pids lists the container's processes: its init and exec processes and
 // every team they started (docker top shows them all, as on Linux).
 func (s *haikuTaskService) Pids(ctx context.Context, req *taskapi.PidsRequest) (*taskapi.PidsResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Pids(ctx, req)
+	}
 	s.mu.Lock()
 	roots := s.rootTeams(req.ID)
 	s.mu.Unlock()
@@ -678,10 +719,16 @@ func (s *haikuTaskService) rootTeams(id string) []int32 {
 }
 
 func (s *haikuTaskService) Pause(ctx context.Context, req *taskapi.PauseRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Pause(ctx, req)
+	}
 	return nil, fmt.Errorf("pause not supported on haiku")
 }
 
 func (s *haikuTaskService) Resume(ctx context.Context, req *taskapi.ResumeRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Resume(ctx, req)
+	}
 	return nil, fmt.Errorf("resume not supported on haiku")
 }
 
@@ -690,6 +737,9 @@ func (s *haikuTaskService) Checkpoint(ctx context.Context, req *taskapi.Checkpoi
 }
 
 func (s *haikuTaskService) Stats(ctx context.Context, req *taskapi.StatsRequest) (*taskapi.StatsResponse, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Stats(ctx, req)
+	}
 	s.mu.Lock()
 	t := s.tasks[req.ID]
 	roots := s.rootTeams(req.ID)
@@ -705,6 +755,9 @@ func (s *haikuTaskService) Stats(ctx context.Context, req *taskapi.StatsRequest)
 }
 
 func (s *haikuTaskService) Update(ctx context.Context, req *taskapi.UpdateTaskRequest) (*emptypb.Empty, error) {
+	if c := s.linuxContainerFor(req.ID); c != nil {
+		return c.tasks.Update(ctx, req)
+	}
 	return &emptypb.Empty{}, nil
 }
 
