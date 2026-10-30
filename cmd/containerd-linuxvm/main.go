@@ -20,6 +20,10 @@
 // connection to its Unix socket sends a header line and becomes one stream
 // to the agent. The haiku shim starts it on demand for the first container
 // from a Linux image.
+//
+//	containerd-linuxvm [flags]             the supervisor
+//	containerd-linuxvm status | stop       ask the running one
+//	containerd-linuxvm run ROOTFS CMD...   a container from a directory
 package main
 
 import (
@@ -90,8 +94,11 @@ func main() {
 	flag.IntVar(&cfg.cpus, "cpus", 0, "the VM's processors (0: half the host's, at most 8)")
 	flag.StringVar(&cfg.share, "share", "/", "the host directory the VM mounts at "+linuxvm.HostMount)
 	flag.Parse()
-	if flag.Arg(0) == "run" {
+	switch flag.Arg(0) {
+	case "run":
 		os.Exit(runContainer(cfg.socket, flag.Args()[1:]))
+	case "status", "stop":
+		os.Exit(request(cfg.socket, flag.Arg(0)))
 	}
 	readSettings(&cfg)
 	if cfg.cpus <= 0 {
@@ -158,6 +165,22 @@ func (v *vm) killStale() {
 }
 
 func (v *vm) pidFile() string { return filepath.Join(v.cfg.stateDir, "qemu.pid") }
+
+// request is "containerd-linuxvm status|stop": asks the running supervisor.
+func request(socket, what string) int {
+	c, err := net.DialTimeout("unix", socket, 5*time.Second)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "the Linux VM's supervisor is not running")
+		return 1
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, what+"\n"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	_, _ = io.Copy(os.Stdout, c)
+	return 0
+}
 
 // listen takes the socket unless a live supervisor already has it.
 func listen(path string) (net.Listener, error) {
