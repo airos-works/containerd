@@ -53,6 +53,7 @@ import (
 // Status is what a "status" request returns.
 type Status struct {
 	Running  bool          `json:"running"`
+	Booting  bool          `json:"booting,omitempty"`
 	QEMUPid  int           `json:"qemuPid,omitempty"`
 	Accel    string        `json:"accel,omitempty"`
 	MemoryMB int           `json:"memoryMB,omitempty"`
@@ -81,7 +82,10 @@ type config struct {
 	qemu     string
 	memoryMB int
 	cpus     int
-	share    string
+	// bootTimeout is how long to wait for the agent, in seconds (0: a
+	// minute, 20 under TCG)
+	bootTimeout int
+	share       string
 }
 
 func main() {
@@ -196,7 +200,8 @@ func listen(path string) (net.Listener, error) {
 }
 
 // readSettings reads "key value" lines from the data directory's
-// settings file (Docker Desktop writes it): memory (MiB) and cpus.
+// settings file (Docker Desktop writes it): memory (MiB), cpus, and
+// boot_timeout (seconds) for unusually slow machines.
 func readSettings(cfg *config) {
 	f, err := os.Open(settingsPath())
 	if err != nil {
@@ -222,6 +227,8 @@ func readSettings(cfg *config) {
 			if cfg.cpus == 0 {
 				cfg.cpus = n
 			}
+		case "boot_timeout":
+			cfg.bootTimeout = n
 		}
 	}
 }
@@ -288,7 +295,10 @@ func (v *vm) handle(c net.Conn) {
 }
 
 func (v *vm) status() Status {
-	v.mu.Lock()
+	// A boot holds the lock until the agent answers: say so rather than wait.
+	if !v.mu.TryLock() {
+		return Status{Booting: true, MemoryMB: v.cfg.memoryMB, CPUs: v.cfg.cpus}
+	}
 	sess, cmd := v.sess, v.cmd
 	s := Status{Accel: v.accel, MemoryMB: v.cfg.memoryMB, CPUs: v.cfg.cpus, Booted: v.booted}
 	if v.lastErr != nil {
@@ -355,7 +365,8 @@ func (v *vm) boot() error {
 		"-smp", strconv.Itoa(v.cfg.cpus),
 		"-m", strconv.Itoa(v.cfg.memoryMB),
 		"-kernel", kernel, "-initrd", initrd,
-		"-append", "console=" + consoleDevice + " quiet panic=-1 rdinit=/init" + kernelArgs,
+		// not quiet: the console log is what tells why a VM did not come up
+		"-append", "console=" + consoleDevice + " panic=-1 rdinit=/init" + kernelArgs,
 		"-no-reboot",
 		"-chardev", "file,id=console,path=" + filepath.Join(v.cfg.stateDir, "console.log"),
 		"-serial", "chardev:console",
@@ -404,6 +415,9 @@ func (v *vm) boot() error {
 	bootTimeout := 60 * time.Second
 	if accel == "tcg" {
 		bootTimeout = 20 * time.Minute
+	}
+	if v.cfg.bootTimeout > 0 {
+		bootTimeout = time.Duration(v.cfg.bootTimeout) * time.Second
 	}
 	if err := ping(sess, exited, bootTimeout); err != nil {
 		sess.Close()
