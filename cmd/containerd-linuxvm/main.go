@@ -111,11 +111,14 @@ func main() {
 		log.Fatal(err)
 	}
 	v := &vm{cfg: cfg}
+	v.killStale()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	stopping := make(chan struct{})
 	go func() {
 		<-sig
+		close(stopping)
 		l.Close()
 		os.Remove(cfg.socket)
 		v.stop()
@@ -125,11 +128,36 @@ func main() {
 	for {
 		c, err := l.Accept()
 		if err != nil {
+			select {
+			case <-stopping:
+				select {} // the signal handler stops the VM and exits
+			default:
+			}
 			log.Fatal(err)
 		}
 		go v.handle(c)
 	}
 }
+
+// killStale stops a VM whose supervisor died without stopping it, so that
+// two never share the agent's socket and the host's files.
+func (v *vm) killStale() {
+	b, err := os.ReadFile(v.pidFile())
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil && p.Signal(syscall.Signal(0)) == nil {
+		log.Printf("stopping the VM a previous supervisor left running (pid %d)", pid)
+		_ = p.Kill()
+	}
+	os.Remove(v.pidFile())
+}
+
+func (v *vm) pidFile() string { return filepath.Join(v.cfg.stateDir, "qemu.pid") }
 
 // listen takes the socket unless a live supervisor already has it.
 func listen(path string) (net.Listener, error) {
@@ -327,6 +355,7 @@ func (v *vm) boot() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start QEMU: %w", err)
 	}
+	_ = os.WriteFile(v.pidFile(), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o644)
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
@@ -437,6 +466,7 @@ func (v *vm) stopLocked() {
 			_ = v.cmd.Process.Kill()
 		}
 		v.cmd = nil
+		os.Remove(v.pidFile())
 	}
 }
 
