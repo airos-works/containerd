@@ -403,7 +403,7 @@ func (v *vm) boot() error {
 	// Without a hypervisor (TCG) the kernel boots several times slower.
 	bootTimeout := 60 * time.Second
 	if accel == "tcg" {
-		bootTimeout = 10 * time.Minute
+		bootTimeout = 20 * time.Minute
 	}
 	if err := ping(sess, exited, bootTimeout); err != nil {
 		sess.Close()

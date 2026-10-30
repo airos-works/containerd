@@ -39,7 +39,7 @@ func Dial(socket, header string) (net.Conn, error) {
 	}
 	// The VM may have to boot first: seconds with a hypervisor, minutes
 	// under emulation.
-	_ = c.SetReadDeadline(time.Now().Add(10 * time.Minute))
+	_ = c.SetReadDeadline(time.Now().Add(20 * time.Minute))
 	br := bufio.NewReader(c)
 	line, err := br.ReadString('\n')
 	_ = c.SetReadDeadline(time.Time{})
