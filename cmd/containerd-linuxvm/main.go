@@ -400,7 +400,12 @@ func (v *vm) boot() error {
 		return fmt.Errorf("%w (see %s)", err, filepath.Join(v.cfg.stateDir, "qemu.log"))
 	}
 	sess := mux.Client(conn)
-	if err := ping(sess, exited, 60*time.Second); err != nil {
+	// Without a hypervisor (TCG) the kernel boots several times slower.
+	bootTimeout := 60 * time.Second
+	if accel == "tcg" {
+		bootTimeout = 10 * time.Minute
+	}
+	if err := ping(sess, exited, bootTimeout); err != nil {
 		sess.Close()
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("the agent did not answer: %w (see %s)", err, filepath.Join(v.cfg.stateDir, "console.log"))
