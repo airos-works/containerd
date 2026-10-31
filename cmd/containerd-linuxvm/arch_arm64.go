@@ -18,7 +18,17 @@ package main
 
 const consoleDevice = "ttyAMA0"
 
-const kernelArgs = ""
+// Under TCG, no kernel page table isolation: KASLR turns it on for cores
+// without E0PD (neoverse-n1 among them), and each switch between the two
+// page tables flushes QEMU's software TLB, which made a system call cost
+// seven times as much. An emulated core does not speculate, so there is no
+// Meltdown for KPTI to guard against.
+func kernelArgs(accel string) string {
+	if accel == "tcg" {
+		return " kpti=off"
+	}
+	return ""
+}
 
 func machineType(accel string) string {
 	if accel == "tcg" {

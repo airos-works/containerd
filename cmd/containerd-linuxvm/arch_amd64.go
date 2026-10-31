@@ -21,7 +21,7 @@ const consoleDevice = "ttyS0"
 // The VCPUs run on the host's TSC, synchronized but for a few hundred
 // cycles across a Threadripper's dies: more than Linux's own check allows,
 // whose fallback (the HPET) costs a VM exit per clock read.
-const kernelArgs = " tsc=reliable"
+func kernelArgs(accel string) string { return " tsc=reliable" }
 
 func machineType(accel string) string { return "q35" }
 

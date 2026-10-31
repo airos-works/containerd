@@ -366,7 +366,7 @@ func (v *vm) boot() error {
 		"-m", strconv.Itoa(v.cfg.memoryMB),
 		"-kernel", kernel, "-initrd", initrd,
 		// not quiet: the console log is what tells why a VM did not come up
-		"-append", "console=" + consoleDevice + " panic=-1 rdinit=/init" + kernelArgs,
+		"-append", "console=" + consoleDevice + " panic=-1 rdinit=/init" + kernelArgs(accel),
 		"-no-reboot",
 		"-chardev", "file,id=console,path=" + filepath.Join(v.cfg.stateDir, "console.log"),
 		"-serial", "chardev:console",
